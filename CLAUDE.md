@@ -36,6 +36,10 @@ pub use yenc::{YencDecodeResult, decode_yenc};
 - **`ArticleCache`** — bounded in-memory cache with disk spill to temp files. LRU eviction with stats (hits, misses, spills). Key: `(job_id, file_id, segment_number)`.
 - **`decode_yenc(&[u8]) -> Result<YencDecodeResult>`** — decodes raw NNTP article data, returns decoded bytes + metadata (filename, part info, CRC32).
 
+## Workspace
+
+- **`ffi/` (`nzb-decode-ffi`, unpublished)** — cdylib `libnzbyenc.so` exporting RapidYenc-compatible C symbols over `decode_yenc`, for FFI callers such as NNTmux. Decodes bare payloads; line endings are skipped and a line-leading `=y` is treated as an escaped byte.
+
 ## Key Dependencies
 
 - yenc-simd (SIMD yEnc decoding)
