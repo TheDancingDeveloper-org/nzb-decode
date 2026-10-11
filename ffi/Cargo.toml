@@ -12,6 +12,9 @@ name = "nzbyenc"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# In the monorepo this resolves through the workspace dependency (and the
+# crates.io patch). The standalone repo has no workspace.dependencies table,
+# so the export (ci/crate-export.sh) rewrites this line to `{ path = ".." }`.
 nzb-decode = { path = ".." }
 crc32fast = "1"
 
