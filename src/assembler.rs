@@ -31,13 +31,34 @@ pub enum AssemblerError {
     Io(#[from] io::Error),
     #[error("File not registered: job={job_id}, file={file_id}")]
     FileNotRegistered { job_id: String, file_id: String },
-    #[error("Segment number {segment} out of range (1..={total})")]
+    #[error("Segment number {segment} is not one of the file's {total} expected segments")]
     SegmentOutOfRange { segment: u32, total: u32 },
     #[error("Empty segment data for segment {segment} — decoded to zero bytes")]
     EmptySegmentData { segment: u32 },
+    #[error(
+        "Segment {segment} writes bytes {begin}..{end}, past the NZB-declared file size of {declared} bytes"
+    )]
+    WriteBeyondDeclaredSize {
+        segment: u32,
+        begin: u64,
+        end: u64,
+        declared: u64,
+    },
 }
 
 pub type AssemblerResult<T> = std::result::Result<T, AssemblerError>;
+
+/// The arguments of one file registration, grouped so the registration
+/// function stays under clippy's argument cap.
+struct FileRegistration<'a> {
+    job_id: &'a str,
+    file_id: &'a str,
+    output_path: PathBuf,
+    segment_numbers: Option<Vec<u32>>,
+    total_segments: u32,
+    completed_segments: &'a [u32],
+    declared_bytes: Option<u64>,
+}
 
 // ---------------------------------------------------------------------------
 // Per-file tracking
@@ -52,7 +73,17 @@ struct FileState {
     file: File,
     /// Total number of segments expected.
     total_segments: u32,
-    /// Which segments have been written (indexed by segment_number - 1).
+    /// The expected segment numbers, sorted and de-duplicated, when they are
+    /// not exactly `1..=total_segments` (an NZB may skip numbers). `None`
+    /// means the contiguous range.
+    segment_numbers: Option<Vec<u32>>,
+    /// Size of the file declared by the NZB, in bytes. Writes are bounded by
+    /// this rather than by the `size=` in a yEnc header, which comes from the
+    /// article itself and cannot be trusted. `None` means the caller did not
+    /// know the size (tests, single-segment files).
+    declared_bytes: Option<u64>,
+    /// Which segments have been written, indexed by the segment's position
+    /// in the expected set (`segment_number - 1` for the contiguous case).
     /// Uses a Vec<AtomicU8> as atomic bitflags so bitmap updates don't
     /// need a write-lock on the outer HashMap.
     written: Vec<std::sync::atomic::AtomicU8>,
@@ -64,8 +95,10 @@ impl FileState {
     fn new(
         output_path: PathBuf,
         file: File,
+        segment_numbers: Option<Vec<u32>>,
         total_segments: u32,
         completed_segments: &[u32],
+        declared_bytes: Option<u64>,
     ) -> Self {
         let written: Vec<std::sync::atomic::AtomicU8> = (0..total_segments)
             .map(|_| std::sync::atomic::AtomicU8::new(0))
@@ -74,20 +107,31 @@ impl FileState {
             output_path,
             file,
             total_segments,
+            segment_numbers,
+            declared_bytes,
             written,
             written_count: AtomicU32::new(0),
         };
         for &segment_number in completed_segments {
-            if segment_number == 0 || segment_number > total_segments {
+            let Some(idx) = state.index_of(segment_number) else {
                 continue;
-            }
-            let idx = (segment_number - 1) as usize;
+            };
             let prev = state.written[idx].swap(1, Ordering::Relaxed);
             if prev == 0 {
                 state.written_count.fetch_add(1, Ordering::Relaxed);
             }
         }
         state
+    }
+
+    /// Position of `segment_number` in the expected set, or `None` if the
+    /// file does not expect that segment.
+    fn index_of(&self, segment_number: u32) -> Option<usize> {
+        match &self.segment_numbers {
+            None => (segment_number != 0 && segment_number <= self.total_segments)
+                .then(|| (segment_number - 1) as usize),
+            Some(numbers) => numbers.binary_search(&segment_number).ok(),
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -104,8 +148,7 @@ impl FileState {
 
     /// Mark a segment as written. Returns `true` if the file just became complete.
     fn mark_written(&self, segment_number: u32) -> bool {
-        let idx = (segment_number - 1) as usize;
-        if idx < self.written.len() {
+        if let Some(idx) = self.index_of(segment_number) {
             // CAS: only increment counter if this is the first time marking this segment
             let prev = self.written[idx].swap(1, Ordering::AcqRel);
             if prev == 0 {
@@ -122,7 +165,10 @@ impl FileState {
             .iter()
             .enumerate()
             .filter(|(_, w)| w.load(Ordering::Relaxed) == 0)
-            .map(|(i, _)| (i + 1) as u32)
+            .map(|(i, _)| match &self.segment_numbers {
+                None => (i + 1) as u32,
+                Some(numbers) => numbers[i],
+            })
             .collect()
     }
 }
@@ -189,6 +235,64 @@ impl FileAssembler {
         total_segments: u32,
         completed_segments: &[u32],
     ) -> AssemblerResult<()> {
+        self.register_inner(FileRegistration {
+            job_id,
+            file_id,
+            output_path,
+            segment_numbers: None,
+            total_segments,
+            completed_segments,
+            declared_bytes: None,
+        })
+    }
+
+    /// Register a file whose expected segments are exactly `segment_numbers`.
+    ///
+    /// NZBs are not guaranteed to number segments `1..=N`: numbers may be
+    /// skipped or repeated. The file completes once every distinct expected
+    /// number has been written; any other number is rejected as
+    /// [`AssemblerError::SegmentOutOfRange`]. `completed_segments` seeds
+    /// segments already written before a resume. `declared_bytes` is the
+    /// file size from the NZB and bounds every write.
+    pub fn register_file_with_segment_numbers(
+        &self,
+        job_id: &str,
+        file_id: &str,
+        output_path: PathBuf,
+        segment_numbers: &[u32],
+        completed_segments: &[u32],
+        declared_bytes: Option<u64>,
+    ) -> AssemblerResult<()> {
+        let mut numbers: Vec<u32> = segment_numbers
+            .iter()
+            .copied()
+            .filter(|&n| n != 0)
+            .collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        let total_segments = numbers.len() as u32;
+        let contiguous = numbers.last().is_none_or(|&last| last == total_segments);
+        self.register_inner(FileRegistration {
+            job_id,
+            file_id,
+            output_path,
+            segment_numbers: (!contiguous).then_some(numbers),
+            total_segments,
+            completed_segments,
+            declared_bytes,
+        })
+    }
+
+    fn register_inner(&self, reg: FileRegistration<'_>) -> AssemblerResult<()> {
+        let FileRegistration {
+            job_id,
+            file_id,
+            output_path,
+            segment_numbers,
+            total_segments,
+            completed_segments,
+            declared_bytes,
+        } = reg;
         // Ensure parent directory exists.
         if let Some(parent) = output_path.parent() {
             fs::create_dir_all(parent)?;
@@ -209,9 +313,28 @@ impl FileAssembler {
         let mut files = self.files.write();
         files.insert(
             key,
-            FileState::new(output_path, file, total_segments, completed_segments),
+            FileState::new(
+                output_path,
+                file,
+                segment_numbers,
+                total_segments,
+                completed_segments,
+                declared_bytes,
+            ),
         );
         Ok(())
+    }
+
+    /// The file size declared by the NZB at registration, if one was given.
+    pub fn declared_bytes(&self, job_id: &str, file_id: &str) -> Option<u64> {
+        let key = FileKey {
+            job_id: job_id.to_string(),
+            file_id: file_id.to_string(),
+        };
+        self.files
+            .read()
+            .get(&key)
+            .and_then(|state| state.declared_bytes)
     }
 
     /// Write a decoded article directly to the output file at the given offset.
@@ -243,7 +366,7 @@ impl FileAssembler {
                 file_id: file_id.to_string(),
             })?;
 
-        if segment_number == 0 || segment_number > state.total_segments {
+        if state.index_of(segment_number).is_none() {
             return Err(AssemblerError::SegmentOutOfRange {
                 segment: segment_number,
                 total: state.total_segments,
@@ -256,6 +379,20 @@ impl FileAssembler {
             return Err(AssemblerError::EmptySegmentData {
                 segment: segment_number,
             });
+        }
+
+        // Bound the write by the size the NZB declared, never by the size
+        // the article claims. A write past it would extend the file.
+        if let Some(declared) = state.declared_bytes {
+            let end = data_begin.saturating_add(data.len() as u64);
+            if end > declared {
+                return Err(AssemblerError::WriteBeyondDeclaredSize {
+                    segment: segment_number,
+                    begin: data_begin,
+                    end,
+                    declared,
+                });
+            }
         }
 
         // pwrite: write at offset without seeking — concurrent-safe on the same fd.
@@ -404,6 +541,53 @@ mod tests {
         assert_eq!(&contents[0..4], b"AAAA");
         assert_eq!(&contents[4..8], b"BBBB");
         assert_eq!(&contents[8..10], b"CC");
+    }
+
+    #[test]
+    fn test_sparse_segment_numbers_complete() {
+        let tmp = TempDir::new().unwrap();
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file_with_segment_numbers(
+                "j1",
+                "f1",
+                tmp.path().join("sparse.bin"),
+                &[4, 1, 2, 2],
+                &[],
+                None,
+            )
+            .unwrap();
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (0, 3));
+        assert_eq!(assembler.missing_segments("j1", "f1"), vec![1, 2, 4]);
+
+        assert!(!assembler.assemble_article("j1", "f1", 4, 8, b"DD").unwrap());
+        assert!(matches!(
+            assembler.assemble_article("j1", "f1", 3, 6, b"CC"),
+            Err(AssemblerError::SegmentOutOfRange { segment: 3, .. })
+        ));
+        assert!(!assembler.assemble_article("j1", "f1", 1, 0, b"AA").unwrap());
+        assert_eq!(assembler.missing_segments("j1", "f1"), vec![2]);
+        assert!(assembler.assemble_article("j1", "f1", 2, 2, b"BB").unwrap());
+        assert!(assembler.is_file_complete("j1", "f1"));
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (3, 3));
+    }
+
+    #[test]
+    fn test_sparse_segment_numbers_seed_completed() {
+        let tmp = TempDir::new().unwrap();
+        let assembler = FileAssembler::new();
+        assembler
+            .register_file_with_segment_numbers(
+                "j1",
+                "f1",
+                tmp.path().join("resume.bin"),
+                &[1, 5, 9],
+                &[5, 9, 7],
+                None,
+            )
+            .unwrap();
+        assert_eq!(assembler.get_file_progress("j1", "f1"), (2, 3));
+        assert!(assembler.assemble_article("j1", "f1", 1, 0, b"A").unwrap());
     }
 
     #[test]
