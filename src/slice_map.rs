@@ -36,7 +36,7 @@ pub enum SliceState {
 }
 
 /// The expected checksums for one slice, from a PAR2 IFSC packet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SliceDigest {
     pub md5: Md5Hash,
     pub crc32: u32,
@@ -184,6 +184,11 @@ impl SliceVerifier {
     /// The verdict of every slice, in global index order.
     pub fn states(&self) -> Vec<SliceState> {
         self.cells.iter().map(|c| c.state).collect()
+    }
+
+    /// The set's slice size.
+    pub fn slice_size(&self) -> u64 {
+        self.slice_size
     }
 
     /// Total number of slices in the set.

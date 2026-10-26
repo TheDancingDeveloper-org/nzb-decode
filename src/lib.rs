@@ -7,10 +7,14 @@
 
 pub mod assembler;
 pub mod cache;
+pub mod repair_fold;
 pub mod slice_map;
 pub mod yenc;
 
 pub use assembler::FileAssembler;
+#[cfg(any(test, feature = "test-support"))]
+pub use assembler::WriteStall;
 pub use cache::ArticleCache;
+pub use repair_fold::{FoldError, RepairFold, SharedFold};
 pub use slice_map::{FileSlices, SliceDigest, SliceLayout, SliceState, SliceVerifier};
 pub use yenc::{YencDecodeResult, decode_yenc};
